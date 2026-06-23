@@ -1,0 +1,1438 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>ProfPrep — UCO CHEM 1114 General Chemistry I / Dr. Montes</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+<style>
+:root{
+  --bg:#0a0f1e;--surf:#0d1528;--surf2:#111827;
+  --border:#1e2840;--border2:#2a3a5c;
+  --text:#e8eaf0;--muted:#64748b;--dim:#334155;
+  --accent:#3b82f6;--accent-text:#fff;
+  --success:#10b981;--success-bg:rgba(16,185,129,.1);--success-border:rgba(16,185,129,.3);
+  --danger:#ef4444;--danger-bg:rgba(239,68,68,.1);--danger-border:rgba(239,68,68,.3);
+  --warning:#f59e0b;
+  --premium:#7c3aed;--premium-bg:rgba(124,58,237,.1);--premium-border:rgba(124,58,237,.3);
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:var(--surf)}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+textarea,input,select{font-family:'Inter',sans-serif;color:var(--text)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@media print{.no-print{display:none!important}body{background:#fff;color:#000}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+// ── Config ────────────────────────────────────────────────────
+const DATA_WORKER   = 'https://profprep-data.jesse-d79.workers.dev';
+const CLAUDE_WORKER = 'https://profprep-claude.jesse-d79.workers.dev';
+const EXAM_TYPE     = 'ucuchem1114-montes-fall2026';
+
+// Stripe payment links
+const STRIPE = {
+  standard:    'https://buy.stripe.com/4gM3cocyzgJk5T2bEm6Na2G',
+  quantitative:'https://buy.stripe.com/4gMbIUbuvakW4OY4bU6Na2H',
+  graduate:    'https://buy.stripe.com/00waEQ7efeBc81a0ZI6Na0i',
+  premium:     'https://buy.stripe.com/7sYeV62XZ8cO2GQ7o66Na0j',
+  topup:       'https://buy.stripe.com/14A8wI2XZ3Wy4OY7o66Na0k',
+};
+</script>
+
+<script type="text/babel">
+const {useState,useEffect,useRef,useCallback,createContext,useContext,useMemo}=React;
+
+// ── Supabase client (config fetched from worker) ─────────────
+let sbClient = null;
+async function getSB(){
+  if(sbClient) return sbClient;
+  const r = await fetch(`${DATA_WORKER}/config`);
+  const {url,anon} = await r.json();
+  sbClient = window.supabase.createClient(url, anon);
+  return sbClient;
+}
+
+// ── Worker API helpers ───────────────────────────────────────
+async function callData(action, data={}, token=null){
+  const sb = await getSB();
+  const sess = token ? {access_token:token} : (await sb.auth.getSession()).data.session;
+  const r = await fetch(`${DATA_WORKER}/data`, {
+    method:'POST',
+    headers:{'Content-Type':'application/json', 'Authorization':`Bearer ${sess?.access_token||''}`},
+    body: JSON.stringify({action, user_id:sess?.user?.id||'00000000-0000-0000-0000-000000000000', exam_type:EXAM_TYPE, data})
+  });
+  if(!r.ok){ const e=await r.json(); throw new Error(e.error||'API error'); }
+  return r.json();
+}
+
+async function callClaude(action, payload){
+  const sb = await getSB();
+  const sess = (await sb.auth.getSession()).data.session;
+  const r = await fetch(CLAUDE_WORKER, {
+    method:'POST',
+    headers:{'Content-Type':'application/json', 'Authorization':`Bearer ${sess?.access_token||''}`},
+    body: JSON.stringify({action, user_id:sess?.user?.id, exam_type:EXAM_TYPE, ...payload})
+  });
+  if(!r.ok){ const e=await r.json(); throw new Error(e.error||'Claude error'); }
+  return r.json();
+}
+
+async function callUpload(file, token){
+  return new Promise((resolve,reject)=>{
+    const reader = new FileReader();
+    reader.onload = async ()=>{
+      try{
+        const base64 = reader.result.split(',')[1];
+        const r = await fetch(`${CLAUDE_WORKER}/upload`,{
+          method:'POST',
+          headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`},
+          body: JSON.stringify({
+            user_id: (await (await getSB()).auth.getSession()).data.session?.user?.id,
+            exam_type: EXAM_TYPE,
+            file_name: file.name,
+            mime_type: file.type,
+            data: base64
+          })
+        });
+        if(!r.ok){ const e=await r.json(); throw new Error(e.error||'Upload failed'); }
+        resolve(await r.json());
+      }catch(e){ reject(e); }
+    };
+    reader.onerror = ()=>reject(new Error('File read failed'));
+    reader.readAsDataURL(file);
+  });
+}
+
+// ── Shared UI components ─────────────────────────────────────
+const Spin=({s=18,c='var(--accent)'})=>(
+  <div style={{width:s,height:s,border:`2px solid ${c}33`,borderTopColor:c,borderRadius:'50%',animation:'spin .7s linear infinite',flexShrink:0}}/>
+);
+const Card=({children,style={}})=>(
+  <div style={{background:'var(--surf)',border:'1px solid var(--border)',borderRadius:10,...style}}>{children}</div>
+);
+const Btn=({onClick,disabled,primary,danger,premium,sm,children,style={}})=>(
+  <button onClick={onClick} disabled={disabled} style={{
+    background:disabled?'var(--surf2)':premium?'var(--premium)':primary?'var(--accent)':danger?'var(--danger-bg)':'var(--surf2)',
+    color:disabled?'var(--muted)':premium||primary?'#fff':danger?'var(--danger)':'var(--muted)',
+    border:danger?'1px solid var(--danger-border)':premium?'none':'none',
+    borderRadius:8,padding:sm?'6px 12px':'9px 16px',
+    fontSize:sm?11:13,fontWeight:600,cursor:disabled?'default':'pointer',
+    transition:'all .15s',...style
+  }}>{children}</button>
+);
+const pct=(a,b)=>b===0?0:Math.round(a/b*100);
+const fmtDate=iso=>new Date(iso).toLocaleDateString('en-US',{month:'short',day:'numeric'});
+const fmtTime=s=>`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+
+// ── Auth context ─────────────────────────────────────────────
+const AuthCtx = createContext(null);
+function AuthProvider({children}){
+  const [session,setSession]=useState(null);
+  const [loading,setLoading]=useState(true);
+  useEffect(()=>{
+    getSB().then(sb=>{
+      sb.auth.getSession().then(({data})=>{setSession(data.session);setLoading(false);});
+      const {data:{subscription}}=sb.auth.onAuthStateChange((_,s)=>setSession(s));
+      return()=>subscription.unsubscribe();
+    });
+  },[]);
+  return <AuthCtx.Provider value={{session,loading}}>{children}</AuthCtx.Provider>;
+}
+const useAuth=()=>useContext(AuthCtx);
+
+// ── Auth screen ──────────────────────────────────────────────
+function AuthScreen(){
+  const [mode,setMode]=useState('signin');
+  const [email,setEmail]=useState('');
+  const [pw,setPw]=useState('');
+  const [name,setName]=useState('');
+  const [loading,setLoading]=useState(false);
+  const [err,setErr]=useState('');
+  const [info,setInfo]=useState('');
+
+  async function submit(e){
+    e.preventDefault();
+    setLoading(true);setErr('');setInfo('');
+    try{
+      const sb=await getSB();
+      if(mode==='signup'){
+        const {error}=await sb.auth.signUp({email,password:pw,options:{data:{display_name:name}}});
+        if(error) throw error;
+        setInfo('Check your email to confirm your account, then sign in.');
+        setMode('signin');
+      } else {
+        const {error}=await sb.auth.signInWithPassword({email,password:pw});
+        if(error) throw error;
+      }
+    }catch(e){setErr(e.message);}
+    finally{setLoading(false);}
+  }
+
+  async function resetPw(){
+    if(!email){setErr('Enter your email first.');return;}
+    setLoading(true);
+    const sb=await getSB();
+    await sb.auth.resetPasswordForEmail(email);
+    setInfo('Password reset email sent.');
+    setLoading(false);
+  }
+
+  return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+      <div style={{width:'100%',maxWidth:400}}>
+        <div style={{textAlign:'center',marginBottom:32}}>
+          <div style={{fontSize:13,fontWeight:700,color:'var(--accent)',letterSpacing:'0.12em',textTransform:'uppercase',marginBottom:6}}>ProfPrep</div>
+          <div style={{fontSize:22,fontWeight:700,marginBottom:4}}>CHEM 1114 — General Chemistry I</div>
+          <div style={{fontSize:13,color:'var(--muted)'}}>University of Central Oklahoma · Dr. Luis Montes</div>
+        </div>
+
+        <Card style={{padding:28}}>
+          <div style={{display:'flex',marginBottom:20,background:'var(--surf2)',borderRadius:8,padding:4,gap:4}}>
+            {['signin','signup'].map(m=>(
+              <button key={m} onClick={()=>{setMode(m);setErr('');setInfo('');}} style={{flex:1,padding:'7px 0',background:mode===m?'var(--surf)':'transparent',border:'none',borderRadius:6,fontSize:13,fontWeight:600,color:mode===m?'var(--text)':'var(--muted)',cursor:'pointer',transition:'all .15s'}}>
+                {m==='signin'?'Sign In':'Create Account'}
+              </button>
+            ))}
+          </div>
+
+          <form onSubmit={submit}>
+            {mode==='signup'&&(
+              <div style={{marginBottom:14}}>
+                <div style={{fontSize:11,fontWeight:600,color:'var(--muted)',marginBottom:6,textTransform:'uppercase',letterSpacing:'0.05em'}}>Full Name</div>
+                <input value={name} onChange={e=>setName(e.target.value)} placeholder="Your name" required style={{width:'100%',background:'var(--surf2)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px',fontSize:14,outline:'none'}}/>
+              </div>
+            )}
+            <div style={{marginBottom:14}}>
+              <div style={{fontSize:11,fontWeight:600,color:'var(--muted)',marginBottom:6,textTransform:'uppercase',letterSpacing:'0.05em'}}>Email</div>
+              <input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="your@email.com" required style={{width:'100%',background:'var(--surf2)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px',fontSize:14,outline:'none'}}/>
+            </div>
+            <div style={{marginBottom:20}}>
+              <div style={{fontSize:11,fontWeight:600,color:'var(--muted)',marginBottom:6,textTransform:'uppercase',letterSpacing:'0.05em'}}>Password</div>
+              <input type="password" value={pw} onChange={e=>setPw(e.target.value)} placeholder="••••••••" required style={{width:'100%',background:'var(--surf2)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px',fontSize:14,outline:'none'}}/>
+            </div>
+            {err&&<div style={{fontSize:12,color:'var(--danger)',background:'var(--danger-bg)',borderRadius:6,padding:'8px 12px',marginBottom:12}}>{err}</div>}
+            {info&&<div style={{fontSize:12,color:'var(--success)',background:'var(--success-bg)',border:'1px solid var(--success-border)',borderRadius:6,padding:'8px 12px',marginBottom:12}}>{info}</div>}
+            <Btn primary style={{width:'100%'}} disabled={loading}>
+              {loading?<span style={{display:'flex',alignItems:'center',gap:8,justifyContent:'center'}}><Spin s={14} c='#fff'/>{mode==='signin'?'Signing in...':'Creating account...'}</span>:mode==='signin'?'Sign In':'Create Account'}
+            </Btn>
+          </form>
+          {mode==='signin'&&(
+            <button onClick={resetPw} style={{background:'none',border:'none',color:'var(--muted)',fontSize:12,marginTop:12,cursor:'pointer',width:'100%',textAlign:'center'}}>Forgot password?</button>
+          )}
+        </Card>
+
+        <div style={{textAlign:'center',marginTop:20,fontSize:12,color:'var(--muted)'}}>
+          Need access? <a href={STRIPE.quantitative} target="_blank" style={{color:'var(--accent)',textDecoration:'none',fontWeight:600}}>Purchase here →</a>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Access gate ──────────────────────────────────────────────
+function AccessGate({session,children}){
+  const [status,setStatus]=useState('checking'); // checking | granted | denied | expired
+  const [isPremium,setIsPremium]=useState(false);
+  const [courseConfig,setCourseConfig]=useState(null);
+  const [usage,setUsage]=useState(null);
+  const [profIntel,setProfIntel]=useState(null);
+
+  useEffect(()=>{
+    async function check(){
+      try{
+        // Check access via payments table
+        const access = await callData('check_access',{email:session.user.email});
+        if(!access.access){ setStatus('denied'); return; }
+
+        // Check expiry
+        const expiry = new Date(access.payment?.expires_at);
+        if(expiry < new Date()){ setStatus('expired'); return; }
+
+        // Load config, usage, professor intel in parallel
+        const [cfg, usageData] = await Promise.all([
+          callData('get_config'),
+          callData('get_usage'),
+        ]);
+
+        // Check premium access
+        const sb = await getSB();
+        const {data:{user}} = await sb.auth.getUser();
+        const isPrem = user?.app_metadata?.premium_access?.includes(EXAM_TYPE) ||
+                       access.payment?.product_type === 'premium' ||
+                       (await callData('get_metadata',{key:'premium_access'})).metadata?.premium_access === 'true';
+
+        setCourseConfig(cfg.config);
+        setUsage(usageData);
+        setIsPremium(isPrem);
+
+        // Build professor intel for system prompt injection
+        // Pulled from the course config which has it embedded
+        const prof = cfg.config?.professor_data || {};
+        setProfIntel({
+          name: prof.name,
+          system_prompt: cfg.config?.professor_system_prompt || buildProfPrompt(cfg.config),
+        });
+
+        setStatus('granted');
+      }catch(e){
+        console.error('Access check failed:',e);
+        setStatus('denied');
+      }
+    }
+    check();
+  },[session]);
+
+  function buildProfPrompt(cfg){
+    if(!cfg) return '';
+    const prof = cfg.professor_data || {};
+    const course = cfg.course_data || {};
+    return `You are a study assistant for ${cfg.professor}'s ${cfg.course_code} (${cfg.course_name}) at ${cfg.university}. ` +
+      `Prof. ${cfg.professor?.split(' ').pop()} teaches at a difficulty of ${prof.rmp_difficulty}/5 on RMP (${prof.rmp_rating}/5 quality). ` +
+      `Exam averages are in the 50s with no curve — exams consist of ~31 MCQs mixing conceptual and computation questions. ` +
+      `She covers most exam-style questions on review days; remaining questions come from homework. ` +
+      `Highest-weight topics: Time Value of Money, Bond Valuation, Risk & Return/CAPM, Stock Valuation, Capital Budgeting. ` +
+      `Use MCQ format for practice questions. Be precise and computation-focused.`;
+  }
+
+  if(status==='checking') return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',gap:12}}>
+      <Spin s={28}/>
+      <div style={{fontSize:13,color:'var(--muted)'}}>Verifying access...</div>
+    </div>
+  );
+
+  if(status==='denied') return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+      <div style={{maxWidth:400,textAlign:'center'}}>
+        <div style={{fontSize:40,marginBottom:16}}>🔒</div>
+        <div style={{fontSize:20,fontWeight:700,marginBottom:8}}>Access Required</div>
+        <div style={{fontSize:14,color:'var(--muted)',marginBottom:24,lineHeight:1.6}}>
+          You need to purchase access to CHEM 1114 — General Chemistry I to use this tool.<br/>
+          One-time payment, valid through December 31, 2026.
+        </div>
+        <div style={{display:'flex',flexDirection:'column',gap:10,marginBottom:20}}>
+          <a href={STRIPE.standard} target="_blank" style={{display:'block',padding:'12px 20px',background:'var(--surf)',border:'1px solid var(--border)',borderRadius:8,textDecoration:'none',color:'var(--text)'}}>
+            <div style={{fontWeight:600,marginBottom:2}}>Standard — $97</div>
+            <div style={{fontSize:12,color:'var(--muted)'}}>Study guide, AI tutor, paper assistant, exams, notes</div>
+          </a>
+          <a href={STRIPE.quantitative} target="_blank" style={{display:'block',padding:'12px 20px',background:'var(--accent)',borderRadius:8,textDecoration:'none',color:'#fff'}}>
+            <div style={{fontWeight:600,marginBottom:2}}>Quantitative — $127 ✓ Recommended</div>
+            <div style={{fontSize:12,opacity:.85}}>Everything + formula reference, worked problems, calculator guides</div>
+          </a>
+          <a href={STRIPE.graduate} target="_blank" style={{display:'block',padding:'12px 20px',background:'var(--surf)',border:'1px solid var(--border)',borderRadius:8,textDecoration:'none',color:'var(--text)'}}>
+            <div style={{fontWeight:600,marginBottom:2}}>Graduate — $147</div>
+            <div style={{fontSize:12,color:'var(--muted)'}}>Everything + case study mode, research synthesis</div>
+          </a>
+        </div>
+        <button onClick={async()=>{const sb=await getSB();sb.auth.signOut();}} style={{background:'none',border:'none',color:'var(--muted)',fontSize:12,cursor:'pointer'}}>Sign out</button>
+      </div>
+    </div>
+  );
+
+  if(status==='expired') return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+      <div style={{maxWidth:360,textAlign:'center'}}>
+        <div style={{fontSize:40,marginBottom:16}}>📅</div>
+        <div style={{fontSize:20,fontWeight:700,marginBottom:8}}>Course Ended</div>
+        <div style={{fontSize:14,color:'var(--muted)',lineHeight:1.6}}>Your access to CHEM 1114 — General Chemistry I Fall 2026 has expired.</div>
+        <button onClick={async()=>{const sb=await getSB();sb.auth.signOut();}} style={{marginTop:20,background:'none',border:'none',color:'var(--muted)',fontSize:12,cursor:'pointer'}}>Sign out</button>
+      </div>
+    </div>
+  );
+
+  return children({courseConfig, usage, setUsage, isPremium, profIntel});
+}
+
+// ── Usage gate ───────────────────────────────────────────────
+function UsageGate({feature, usage, setUsage, children, courseConfig}){
+  const limits = courseConfig?.usage_limits || {};
+  const limitMap = {guide:40,tutor:150,exam:40,paper:20,notesheet:20};
+  const limit = limits[feature] ?? limitMap[feature] ?? 30;
+  const used = usage?.usage?.[`${feature}_used`] || 0;
+  const remaining = Math.max(0, limit - used);
+
+  async function trackUsage(){
+    try{
+      await callData('track_usage',{feature});
+      setUsage(prev=>({
+        ...prev,
+        usage:{...prev.usage,[`${feature}_used`]:(prev.usage?.[`${feature}_used`]||0)+1},
+        remaining:{...prev.remaining,[feature]:Math.max(0,(prev.remaining?.[feature]||0)-1)}
+      }));
+    }catch(e){ console.error('Usage track failed:',e); }
+  }
+
+  if(remaining === 0) return(
+    <div style={{padding:24,textAlign:'center'}}>
+      <div style={{fontSize:32,marginBottom:12}}>📊</div>
+      <div style={{fontSize:16,fontWeight:600,marginBottom:8}}>Monthly limit reached</div>
+      <div style={{fontSize:13,color:'var(--muted)',marginBottom:20,lineHeight:1.6}}>
+        You've used all {limit} {feature} sessions for this month.<br/>
+        Reset your limits to keep going.
+      </div>
+      <a href={STRIPE.topup} target="_blank" style={{display:'inline-block',padding:'10px 24px',background:'var(--accent)',borderRadius:8,textDecoration:'none',color:'#fff',fontSize:13,fontWeight:600}}>
+        Reset Limits — $13.99 →
+      </a>
+      <div style={{fontSize:11,color:'var(--muted)',marginTop:10}}>Limits reset automatically each month</div>
+    </div>
+  );
+
+  return children({trackUsage, remaining, limit});
+}
+
+// ── Topic picker ─────────────────────────────────────────────
+function TopicPicker({topics, selected, onSelect, multi=false}){
+  function toggle(t){
+    if(multi){
+      const exists = selected.find(x=>x.name===t.name);
+      onSelect(exists ? selected.filter(x=>x.name!==t.name) : [...selected,t]);
+    } else {
+      onSelect(t);
+    }
+  }
+  const isSel = t => multi ? !!selected.find(x=>x.name===t.name) : selected?.name===t.name;
+  return(
+    <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(180px,1fr))',gap:8,marginBottom:16}}>
+      {topics.map(t=>(
+        <button key={t.name} onClick={()=>toggle(t)} style={{
+          background:isSel(t)?'var(--accent)':'var(--surf)',
+          border:`1px solid ${isSel(t)?'var(--accent)':'var(--border)'}`,
+          borderRadius:8,padding:'10px 12px',cursor:'pointer',textAlign:'left',transition:'all .15s'
+        }}>
+          <div style={{display:'flex',gap:8,alignItems:'center'}}>
+            <span style={{fontSize:16,flexShrink:0}}>{t.emoji}</span>
+            <div>
+              <div style={{fontSize:11,fontWeight:600,color:isSel(t)?'#fff':'var(--text)',lineHeight:1.3}}>
+                {t.chapter?`Ch ${t.chapter}: `:''}  {t.name}
+              </div>
+              {t.weight&&<div style={{fontSize:9,color:isSel(t)?'rgba(255,255,255,.7)':'var(--muted)',textTransform:'uppercase',letterSpacing:'0.05em',marginTop:1}}>
+                {t.weight==='high'?'⬆ high weight':t.weight==='medium'?'◆ medium weight':'↓ low weight'}
+              </div>}
+            </div>
+          </div>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ── Dashboard ────────────────────────────────────────────────
+function DashboardTab({session, setTab, courseConfig, usage, isPremium}){
+  const [progress,setProgress]=useState(null);
+  const topics = courseConfig?.topics || [];
+  const limits = courseConfig?.usage_limits || {};
+
+  useEffect(()=>{
+    callData('get_progress').then(d=>setProgress(d)).catch(()=>{});
+  },[]);
+
+  const features = [
+    {id:'guide',label:'Study Guide',icon:'📖',tab:'guide'},
+    {id:'tutor',label:'AI Tutor',icon:'💬',tab:'tutor'},
+    {id:'exam',label:'Practice Exam',icon:'📝',tab:'exam'},
+    {id:'paper',label:'Paper Writer',icon:'✍️',tab:'paper'},
+    {id:'notesheet',label:'Note Sheet',icon:'📋',tab:'notes'},
+    {id:'upload',label:'Uploads',icon:'📁',tab:'uploads'},
+  ];
+
+  function UsageBar({feature, label}){
+    const lim = limits[feature] ?? {guide:40,tutor:150,exam:40,paper:20,notesheet:20}[feature] ?? 30;
+    const used = usage?.usage?.[`${feature}_used`] || 0;
+    const rem = Math.max(0, lim - used);
+    const pctUsed = pct(used, lim);
+    const color = pctUsed >= 90 ? 'var(--danger)' : pctUsed >= 70 ? 'var(--warning)' : 'var(--accent)';
+    return(
+      <div style={{marginBottom:10}}>
+        <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+          <span style={{fontSize:12,color:'var(--muted)'}}>{label}</span>
+          <span style={{fontSize:12,color:rem===0?'var(--danger)':'var(--text)',fontWeight:500}}>{rem} left</span>
+        </div>
+        <div style={{height:4,background:'var(--surf2)',borderRadius:2,overflow:'hidden'}}>
+          <div style={{height:'100%',width:`${pctUsed}%`,background:color,borderRadius:2,transition:'width .3s'}}/>
+        </div>
+      </div>
+    );
+  }
+
+  const daysLeft = Math.max(0, Math.ceil((new Date('2026-12-31') - new Date()) / 86400000));
+
+  return(
+    <div style={{animation:'fadeIn .3s ease'}}>
+      {/* Header */}
+      <div style={{marginBottom:24}}>
+        <div style={{fontSize:20,fontWeight:700,marginBottom:4}}>Welcome back</div>
+        <div style={{fontSize:13,color:'var(--muted)'}}>CHEM 1114 — General Chemistry I · UCO · {{daysLeft}} days until end of semester</div>
+      </div>
+
+      {/* Professor Intel Card */}
+      <Card style={{padding:16,marginBottom:16,border:'1px solid var(--border2)'}}>
+        <div style={{fontSize:11,fontWeight:600,color:'var(--accent)',textTransform:'uppercase',letterSpacing:'0.08em',marginBottom:8}}>Professor Intelligence</div>
+        <div style={{fontSize:13,lineHeight:1.6,color:'var(--text)',marginBottom:10}}>
+          Dr. Montes is among the highest-rated chemistry professors at UCO. <strong>Flipped classroom — short pre-recorded lectures, then in-class worksheets.</strong> Chapter-by-chapter Quests (not cumulative exams) — work through each worksheet 2–3 times before your Quest and you'll do great. Accessible, fast email responses, engaged in class.
+        </div>
+        <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
+          {['Tough Exams','Fast-Paced','Caring','Attendance Mandatory','Lots of Homework'].map(tag=>(
+            <span key={tag} style={{fontSize:10,padding:'3px 8px',background:'var(--surf2)',border:'1px solid var(--border2)',borderRadius:4,color:'var(--muted)'}}>{tag}</span>
+          ))}
+        </div>
+        <div style={{display:'flex',gap:16,marginTop:12,paddingTop:12,borderTop:'1px solid var(--border)'}}>
+          <div style={{textAlign:'center'}}>
+            <div style={{fontSize:18,fontWeight:700,color:'var(--warning)'}}>3.0</div>
+            <div style={{fontSize:10,color:'var(--muted)'}}>RMP Rating</div>
+          </div>
+          <div style={{textAlign:'center'}}>
+            <div style={{fontSize:18,fontWeight:700,color:'var(--danger)'}}>4.1</div>
+            <div style={{fontSize:10,color:'var(--muted)'}}>Difficulty</div>
+          </div>
+          <div style={{textAlign:'center'}}>
+            <div style={{fontSize:18,fontWeight:700,color:'var(--muted)'}}>47%</div>
+            <div style={{fontSize:10,color:'var(--muted)'}}>Would Retake</div>
+          </div>
+          <div style={{textAlign:'center'}}>
+            <div style={{fontSize:18,fontWeight:700,color:'var(--accent)'}}>32</div>
+            <div style={{fontSize:10,color:'var(--muted)'}}>Reviews</div>
+          </div>
+        </div>
+      </Card>
+
+      {/* Quick access */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,marginBottom:20}}>
+        {features.map(f=>(
+          <button key={f.id} onClick={()=>setTab(f.tab)} style={{background:'var(--surf)',border:'1px solid var(--border)',borderRadius:8,padding:'14px 10px',cursor:'pointer',textAlign:'center',transition:'all .15s'}}>
+            <div style={{fontSize:22,marginBottom:4}}>{f.icon}</div>
+            <div style={{fontSize:11,fontWeight:600,color:'var(--text)'}}>{f.label}</div>
+          </button>
+        ))}
+      </div>
+
+      {/* Usage this month */}
+      <Card style={{padding:16,marginBottom:16}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+          <div style={{fontSize:13,fontWeight:600}}>Usage this month</div>
+          <a href={STRIPE.topup} target="_blank" style={{fontSize:11,color:'var(--accent)',textDecoration:'none'}}>Reset limits →</a>
+        </div>
+        <UsageBar feature="guide" label="Study Guides"/>
+        <UsageBar feature="tutor" label="AI Tutor"/>
+        <UsageBar feature="exam" label="Practice Exams"/>
+        <UsageBar feature="paper" label="Paper Writer"/>
+        <UsageBar feature="notesheet" label="Note Sheets"/>
+      </Card>
+
+      {/* High-weight topics */}
+      <Card style={{padding:16}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:12}}>High-weight topics</div>
+        {topics.filter(t=>t.weight==='high').map(t=>(
+          <div key={t.name} style={{display:'flex',alignItems:'center',gap:10,padding:'8px 0',borderBottom:'1px solid var(--border)'}}>
+            <span style={{fontSize:18}}>{t.emoji}</span>
+            <div style={{flex:1}}>
+              <div style={{fontSize:12,fontWeight:500}}>{t.chapter?`Ch ${t.chapter}: `:''}  {t.name}</div>
+              <div style={{fontSize:11,color:'var(--muted)',marginTop:1,lineHeight:1.4}}>{t.description}</div>
+            </div>
+            <button onClick={()=>setTab('exam')} style={{background:'var(--surf2)',border:'1px solid var(--border)',borderRadius:6,padding:'4px 8px',fontSize:10,color:'var(--muted)',cursor:'pointer'}}>Practice</button>
+          </div>
+        ))}
+      </Card>
+    </div>
+  );
+}
+
+// ── Study / Tutor tab ────────────────────────────────────────
+function StudyTab({session, courseConfig, usage, setUsage, profIntel}){
+  const [msgs,setMsgs]=useState([]);
+  const [input,setInput]=useState('');
+  const [loading,setLoading]=useState(false);
+  const [uploadCtx,setUploadCtx]=useState('');
+  const [topic,setTopic]=useState(null);
+  const topics = courseConfig?.topics || [];
+  const tutor_prompts = courseConfig?.tutor_prompts || {};
+  const bottomRef=useRef(null);
+
+  useEffect(()=>{
+    // Load upload context for injection
+    callData('get_upload_context').then(d=>setUploadCtx(d.context||'')).catch(()=>{});
+    // Welcome message
+    setMsgs([{role:'assistant',content:`Welcome to your CHEM 1114 tutor. Dr. Montes runs a flipped classroom — you watch short videos before class and work through worksheets in small groups.\n\nHis Quests (exams) cover one chapter at a time, so keeping up week-by-week is the entire strategy.\n\nCore topics: atomic theory, stoichiometry, bonding, gas laws, thermochemistry, solutions. What chapter Quest are we preparing for?`}]);
+  },[]);
+
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[msgs]);
+
+  function buildSystem(){
+    const topicCtx = topic ? `Current focus: ${topic.name}. ${topic.description||''}` : '';
+    const uploadSection = uploadCtx ? `\n\nStudent's uploaded materials:\n${uploadCtx}` : '';
+    return `${profIntel?.system_prompt||''}\n\n${topicCtx}${uploadSection}\n\nUse Socratic questioning — guide the student to understanding rather than just providing answers. When they get something wrong, explain why gently. Keep responses concise and exam-focused.`;
+  }
+
+  async function send(){
+    if(!input.trim()||loading) return;
+    const userMsg = {role:'user',content:input.trim()};
+    const next = [...msgs, userMsg];
+    setMsgs(next);setInput('');setLoading(true);
+    try{
+      const d = await callClaude('chat',{
+        session_id: session.user.id+'_study',
+        message: userMsg.content,
+        system: buildSystem(),
+        messages: next.slice(-10).map(m=>({role:m.role,content:m.content}))
+      });
+      const reply = d.response || d.content || '';
+      setMsgs([...next,{role:'assistant',content:reply}]);
+      await callData('track_usage',{feature:'tutor'});
+      setUsage(prev=>({...prev,usage:{...prev.usage,tutor_used:(prev.usage?.tutor_used||0)+1}}));
+    }catch(e){setMsgs([...next,{role:'assistant',content:'Error: '+e.message}]);}
+    finally{setLoading(false);}
+  }
+
+  return(
+    <div style={{display:'flex',flexDirection:'column',height:'calc(100vh - 120px)',animation:'fadeIn .3s ease'}}>
+      {/* Topic quick-select */}
+      <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:12}}>
+        {Object.entries(tutor_prompts).map(([k,v])=>(
+          <button key={k} onClick={()=>{setInput(v);}} style={{background:'var(--surf)',border:'1px solid var(--border)',borderRadius:16,padding:'4px 10px',fontSize:11,color:'var(--muted)',cursor:'pointer'}}>{k}</button>
+        ))}
+      </div>
+
+      {/* Topic filter */}
+      <select value={topic?.name||''} onChange={e=>setTopic(topics.find(t=>t.name===e.target.value)||null)}
+        style={{background:'var(--surf)',border:'1px solid var(--border)',borderRadius:8,padding:'8px 12px',fontSize:13,marginBottom:12,outline:'none'}}>
+        <option value="">All topics</option>
+        {topics.map(t=><option key={t.name} value={t.name}>{t.chapter?`Ch ${t.chapter}: `:''}  {t.name}</option>)}
+      </select>
+
+      {/* Messages */}
+      <div style={{flex:1,overflowY:'auto',display:'flex',flexDirection:'column',gap:12,paddingBottom:12}}>
+        {msgs.map((m,i)=>(
+          <div key={i} style={{display:'flex',gap:10,alignItems:'flex-start',flexDirection:m.role==='user'?'row-reverse':'row'}}>
+            <div style={{width:28,height:28,borderRadius:'50%',background:m.role==='user'?'var(--accent)':'var(--surf2)',border:'1px solid var(--border2)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:12,fontWeight:700,flexShrink:0}}>
+              {m.role==='user'?'U':'P'}
+            </div>
+            <div style={{maxWidth:'80%',background:m.role==='user'?'var(--accent)':'var(--surf)',border:`1px solid ${m.role==='user'?'var(--accent)':'var(--border)'}`,borderRadius:10,padding:'10px 14px',fontSize:13,lineHeight:1.6,color:m.role==='user'?'#fff':'var(--text)',whiteSpace:'pre-wrap'}}>
+              {m.content}
+            </div>
+          </div>
+        ))}
+        {loading&&<div style={{display:'flex',gap:10,alignItems:'center'}}>
+          <div style={{width:28,height:28,borderRadius:'50%',background:'var(--surf2)',border:'1px solid var(--border2)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:12}}>P</div>
+          <div style={{background:'var(--surf)',border:'1px solid var(--border)',borderRadius:10,padding:'10px 14px'}}>
+            <Spin s={14}/>
+          </div>
+        </div>}
+        <div ref={bottomRef}/>
+      </div>
+
+      {/* Input */}
+      <div style={{display:'flex',gap:8,paddingTop:12,borderTop:'1px solid var(--border)'}}>
+        <textarea value={input} onChange={e=>setInput(e.target.value)}
+          onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}}
+          placeholder="Ask about any concept, formula, or exam topic..." rows={2}
+          style={{flex:1,background:'var(--surf)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px',fontSize:13,resize:'none',outline:'none',lineHeight:1.5}}/>
+        <Btn primary onClick={send} disabled={loading||!input.trim()} style={{alignSelf:'flex-end'}}>Send</Btn>
+      </div>
+    </div>
+  );
+}
+
+// ── Study Guide tab ──────────────────────────────────────────
+function GuideTab({session, courseConfig, usage, setUsage, profIntel}){
+  const [topic,setTopic]=useState(null);
+  const [depth,setDepth]=useState('standard');
+  const [focus,setFocus]=useState('all');
+  const [content,setContent]=useState('');
+  const [loading,setLoading]=useState(false);
+  const [err,setErr]=useState('');
+  const [uploadCtx,setUploadCtx]=useState('');
+  const topics = courseConfig?.topics || [];
+
+  useEffect(()=>{ callData('get_upload_context').then(d=>setUploadCtx(d.context||'')).catch(()=>{}); },[]);
+
+  const depthMap={quick:'a quick overview',standard:'a comprehensive guide',deep:'an in-depth deep-dive'};
+  const focusMap={all:'Cover both conceptual understanding and computation.',concept:'Focus on conceptual understanding and the theory behind each topic.',computation:'Focus on computation — formulas, step-by-step examples, and calculator keystrokes.',exam:'Focus on exam strategy — what Chan tests most, common mistakes, and how to approach MCQs.'};
+
+  async function generate(){
+    if(!topic){setErr('Select a topic first.');return;}
+    setLoading(true);setErr('');setContent('');
+    const uploadSection = uploadCtx ? `\nStudent uploaded materials for context:\n${uploadCtx}` : '';
+    const sys = `${profIntel?.system_prompt||''}\n\nCreate study guides in HTML: use <h3> for sections, <h4> for subsections, <ul><li> for lists, <strong> for key terms, <p> for explanation, <div class="formula-box" style="background:#1e2840;border:1px solid #2a3a5c;border-left:3px solid #3b82f6;border-radius:6px;padding:12px 16px;margin:10px 0;font-family:monospace;font-size:13px"> for formulas. End with <div style="background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);border-radius:8px;padding:14px 16px;margin-top:16px"><strong style="color:#10b981">🔑 CHEM 1114 Montes Quest Key Points:</strong><ul style="margin-top:8px">[key exam takeaways specific to how Chan tests this]</ul></div>. HTML only.${uploadSection}`;
+    try{
+      const d = await callClaude('generate',{
+        system: sys,
+        messages:[{role:'user',content:`Create ${depthMap[depth]} for ${topic.chapter?'Chapter '+topic.chapter+': ':''}${topic.name} in this course at UCO. ${focusMap[focus]} Calibrate difficulty and examples to your professor's known exam style.`}],
+        max_tokens:2000
+      });
+      const text = (d.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
+      setContent(text);
+      await callData('track_usage',{feature:'guide'});
+      setUsage(prev=>({...prev,usage:{...prev.usage,guide_used:(prev.usage?.guide_used||0)+1}}));
+      await callData('log_session',{mode:'guide',topic:topic.name});
+    }catch(e){setErr('Failed: '+e.message);}
+    finally{setLoading(false);}
+  }
+
+  return(
+    <div style={{animation:'fadeIn .3s ease'}}>
+      <Card style={{padding:16,marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:12}}>Select topic</div>
+        <TopicPicker topics={topics} selected={topic} onSelect={setTopic}/>
+
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:12}}>
+          <div>
+            <div style={{fontSize:11,color:'var(--muted)',marginBottom:6}}>Depth</div>
+            <select value={depth} onChange={e=>setDepth(e.target.value)} style={{width:'100%',background:'var(--surf2)',border:'1px solid var(--border)',borderRadius:6,padding:'7px 10px',fontSize:12,outline:'none'}}>
+              <option value="quick">Quick overview</option>
+              <option value="standard">Standard guide</option>
+              <option value="deep">Deep dive</option>
+            </select>
+          </div>
+          <div>
+            <div style={{fontSize:11,color:'var(--muted)',marginBottom:6}}>Focus</div>
+            <select value={focus} onChange={e=>setFocus(e.target.value)} style={{width:'100%',background:'var(--surf2)',border:'1px solid var(--border)',borderRadius:6,padding:'7px 10px',fontSize:12,outline:'none'}}>
+              <option value="all">Concepts + computation</option>
+              <option value="concept">Concepts only</option>
+              <option value="computation">Computation + formulas</option>
+              <option value="exam">Exam strategy</option>
+            </select>
+          </div>
+        </div>
+
+        {err&&<div style={{fontSize:12,color:'var(--danger)',background:'var(--danger-bg)',borderRadius:6,padding:'8px 12px',marginBottom:10}}>{err}</div>}
+        <Btn primary onClick={generate} disabled={loading||!topic} style={{width:'100%'}}>
+          {loading?<span style={{display:'flex',alignItems:'center',gap:8,justifyContent:'center'}}><Spin s={14} c='#fff'/>Generating...</span>:'Generate Study Guide'}
+        </Btn>
+      </Card>
+
+      {content&&(
+        <Card style={{padding:16}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+            <div style={{fontSize:13,fontWeight:600}}>{topic?.name}</div>
+            <div style={{display:'flex',gap:8}}>
+              <Btn sm onClick={()=>navigator.clipboard?.writeText(content.replace(/<[^>]+>/g,''))}>Copy text</Btn>
+              <Btn sm onClick={()=>window.print()}>Print</Btn>
+            </div>
+          </div>
+          <div style={{fontSize:13,lineHeight:1.7,color:'var(--text)'}} dangerouslySetInnerHTML={{__html:content}}/>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ── Exam tab ─────────────────────────────────────────────────
+function ExamTab({session, courseConfig, usage, setUsage, profIntel}){
+  const [phase,setPhase]=useState('setup');
+  const [selectedTopics,setSelectedTopics]=useState([]);
+  const [count,setCount]=useState(10);
+  const [qType,setQType]=useState('mixed');
+  const [questions,setQuestions]=useState([]);
+  const [answers,setAnswers]=useState({});
+  const [revealed,setRevealed]=useState({});
+  const [timeLeft,setTimeLeft]=useState(0);
+  const [running,setRunning]=useState(false);
+  const [loading,setLoading]=useState(false);
+  const [err,setErr]=useState('');
+  const timerRef=useRef(null);
+  const topics = courseConfig?.topics || [];
+  const TPAQ = courseConfig?.exam_timer_minutes || 90;
+
+  useEffect(()=>{
+    if(running&&timeLeft>0){timerRef.current=setTimeout(()=>setTimeLeft(t=>t-1),1000);}
+    else if(running&&timeLeft===0){setRunning(false);finish();}
+    return()=>clearTimeout(timerRef.current);
+  },[running,timeLeft]);
+
+  const typeMap={mixed:'mixed MCQ and computation',mcq:'conceptual MCQ only',computation:'computation/calculation focus'};
+
+  async function generate(){
+    if(!selectedTopics.length){setErr('Select at least one topic.');return;}
+    setPhase('loading');setErr('');setAnswers({});setRevealed({});
+    const topicList=selectedTopics.map(t=>`${t.chapter?'Ch '+t.chapter+': ':''}${t.name}`).join(', ');
+    const sys=`${profIntel?.system_prompt||''}\n\nYou generate exam questions for this course at UCO. Topics: ${topicList}. Generate EXACTLY ${count} ${typeMap[qType]} questions matching your professor's exam style (~31 MCQ per exam, mix conceptual and computation, difficulty calibrated to exam averages in the 50s). Return ONLY valid JSON: {"questions":[{"q":"question text","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"clinical explanation of why correct and why each wrong option fails","topic":"topic name","type":"conceptual|computation"}]}`;
+    try{
+      const d = await callClaude('generate',{
+        system:sys,
+        messages:[{role:'user',content:`Generate ${count} this course exam questions covering: ${topicList}. ${typeMap[qType]}.`}],
+        max_tokens:3000
+      });
+      const text=(d.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('');
+      const clean=text.replace(/```json\n?/g,'').replace(/```\n?/g,'').trim();
+      const parsed=JSON.parse(clean);
+      setQuestions(parsed.questions||[]);
+      setTimeLeft((parsed.questions?.length||count)*TPAQ);
+      setRunning(true);setPhase('taking');
+    }catch(e){setErr('Failed to generate: '+e.message);setPhase('setup');}
+  }
+
+  function pick(qi,opt){if(!revealed[qi])setAnswers(a=>({...a,[qi]:opt}));}
+  function revealOne(qi){setRevealed(r=>({...r,[qi]:true}));}
+  function revealAll(){const all={};questions.forEach((_,i)=>{all[i]=true;});setRevealed(all);}
+
+  async function finish(){
+    setRunning(false);revealAll();
+    const score=questions.reduce((a,q,i)=>a+(answers[i]===q.answer?1:0),0);
+    setPhase('results');
+    await callData('track_usage',{feature:'exam'});
+    setUsage(prev=>({...prev,usage:{...prev.usage,exam_used:(prev.usage?.exam_used||0)+1}}));
+    await callData('log_session',{mode:'exam',score_pct:pct(score,questions.length)});
+    // Save progress per topic
+    for(const t of selectedTopics){
+      const tQs=questions.filter(q=>q.topic===t.name);
+      if(tQs.length){
+        const correct=tQs.filter((q,i)=>answers[questions.indexOf(q)]===q.answer).length;
+        await callData('save_progress',{topic:t.name,correct,total:tQs.length}).catch(()=>{});
+      }
+    }
+  }
+
+  const score=questions.reduce((a,q,i)=>a+(answers[i]===q.answer?1:0),0);
+  const scoreColor = score/questions.length >= .7 ? 'var(--success)' : score/questions.length >= .5 ? 'var(--warning)' : 'var(--danger)';
+  const warn=timeLeft<=60&&running;
+
+  if(phase==='setup') return(
+    <div style={{animation:'fadeIn .3s ease'}}>
+      <Card style={{padding:16,marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:4}}>Build your practice exam</div>
+        <div style={{fontSize:12,color:'var(--muted)',marginBottom:14,lineHeight:1.5}}>Questions calibrated to Montes's CHEM 1114 Quest format — chapter-by-chapter, worksheet-driven, flipped classroom style.</div>
+        <TopicPicker topics={topics} selected={selectedTopics} onSelect={setSelectedTopics} multi={true}/>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:12}}>
+          <div>
+            <div style={{fontSize:11,color:'var(--muted)',marginBottom:6}}>Question count</div>
+            <select value={count} onChange={e=>setCount(Number(e.target.value))} style={{width:'100%',background:'var(--surf2)',border:'1px solid var(--border)',borderRadius:6,padding:'7px 10px',fontSize:12,outline:'none'}}>
+              {[5,10,15,20,31].map(n=><option key={n} value={n}>{n} questions{n===31?' (full exam)':''}</option>)}
+            </select>
+          </div>
+          <div>
+            <div style={{fontSize:11,color:'var(--muted)',marginBottom:6}}>Question type</div>
+            <select value={qType} onChange={e=>setQType(e.target.value)} style={{width:'100%',background:'var(--surf2)',border:'1px solid var(--border)',borderRadius:6,padding:'7px 10px',fontSize:12,outline:'none'}}>
+              <option value="mixed">Mixed (recommended)</option>
+              <option value="mcq">Conceptual only</option>
+              <option value="computation">Computation only</option>
+            </select>
+          </div>
+        </div>
+        {err&&<div style={{fontSize:12,color:'var(--danger)',background:'var(--danger-bg)',borderRadius:6,padding:'8px 12px',marginBottom:10}}>{err}</div>}
+        <Btn primary onClick={generate} disabled={!selectedTopics.length} style={{width:'100%'}}>Generate Exam</Btn>
+      </Card>
+    </div>
+  );
+
+  if(phase==='loading') return(
+    <div style={{display:'flex',alignItems:'center',justifyContent:'center',padding:60,flexDirection:'column',gap:16}}>
+      <Spin s={32}/>
+      <div style={{fontSize:13,color:'var(--muted)'}}>Building your exam...</div>
+    </div>
+  );
+
+  if(phase==='results') return(
+    <div style={{animation:'fadeIn .3s ease'}}>
+      <Card style={{padding:20,textAlign:'center',marginBottom:16}}>
+        <div style={{fontSize:48,fontWeight:700,color:scoreColor,marginBottom:4}}>{score}/{questions.length}</div>
+        <div style={{fontSize:20,fontWeight:600,marginBottom:4}}>{pct(score,questions.length)}%</div>
+        <div style={{fontSize:13,color:'var(--muted)',marginBottom:16}}>
+          {pct(score,questions.length)>=70?'Above average — Montes's class rewards consistent preparation.':pct(score,questions.length)>=50?'Near average. Work through the worksheet for this chapter 2–3 more times before your Quest.':'Below average. Go back to the pre-recorded lecture for this chapter, then re-do every worksheet problem.'}
+        </div>
+        <div style={{display:'flex',gap:8,justifyContent:'center'}}>
+          <Btn primary onClick={()=>{setPhase('setup');setQuestions([]);setAnswers({});setRevealed({});setSelectedTopics([]);}}>New Exam</Btn>
+          <Btn onClick={()=>window.print()}>Print Results</Btn>
+        </div>
+      </Card>
+      {questions.map((q,i)=>{
+        const correct=answers[i]===q.answer;
+        return(
+          <Card key={i} style={{padding:14,marginBottom:8,border:`1px solid ${correct?'var(--success-border)':'var(--danger-border)'}`}}>
+            <div style={{fontSize:12,fontWeight:600,color:correct?'var(--success)':'var(--danger)',marginBottom:6}}>{correct?'✓ Correct':'✗ Incorrect'} — Q{i+1} · {q.topic}</div>
+            <div style={{fontSize:13,marginBottom:10,lineHeight:1.5}}>{q.q}</div>
+            {Object.entries(q.options).map(([k,v])=>(
+              <div key={k} style={{fontSize:12,padding:'5px 10px',borderRadius:6,marginBottom:4,
+                background:k===q.answer?'var(--success-bg)':k===answers[i]&&!correct?'var(--danger-bg)':'transparent',
+                border:`1px solid ${k===q.answer?'var(--success-border)':k===answers[i]&&!correct?'var(--danger-border)':'var(--border)'}`,
+                color:k===q.answer?'var(--success)':k===answers[i]&&!correct?'var(--danger)':'var(--muted)'}}>
+                <strong>{k}.</strong> {v}
+              </div>
+            ))}
+            <div style={{fontSize:12,color:'var(--muted)',marginTop:8,lineHeight:1.5,background:'var(--surf2)',borderRadius:6,padding:'8px 10px'}}>{q.explanation}</div>
+          </Card>
+        );
+      })}
+    </div>
+  );
+
+  // Taking exam
+  const allAnswered=questions.length>0&&questions.every((_,i)=>answers[i]!==undefined);
+  return(
+    <div style={{animation:'fadeIn .3s ease'}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16,position:'sticky',top:0,background:'var(--bg)',padding:'8px 0',zIndex:10}}>
+        <div style={{fontSize:13,fontWeight:600}}>{score} / {questions.length} answered</div>
+        <div style={{fontSize:16,fontWeight:700,color:warn?'var(--danger)':'var(--text)',animation:warn?'pulse 1s infinite':'none'}}>{fmtTime(timeLeft)}</div>
+        <Btn sm danger onClick={finish}>End & Score</Btn>
+      </div>
+      {questions.map((q,i)=>(
+        <Card key={i} style={{padding:14,marginBottom:10}}>
+          <div style={{fontSize:11,color:'var(--muted)',marginBottom:6}}>Q{i+1} · {q.topic} · {q.type}</div>
+          <div style={{fontSize:13,fontWeight:500,marginBottom:10,lineHeight:1.5}}>{q.q}</div>
+          <div style={{display:'flex',flexDirection:'column',gap:6,marginBottom:revealed[i]?12:0}}>
+            {Object.entries(q.options).map(([k,v])=>(
+              <button key={k} onClick={()=>pick(i,k)} style={{
+                textAlign:'left',padding:'8px 12px',borderRadius:6,fontSize:12,cursor:revealed[i]?'default':'pointer',
+                background:revealed[i]?(k===q.answer?'var(--success-bg)':k===answers[i]?'var(--danger-bg)':'var(--surf2)'):(answers[i]===k?'var(--accent)':'var(--surf2)'),
+                border:`1px solid ${revealed[i]?(k===q.answer?'var(--success-border)':k===answers[i]?'var(--danger-border)':'var(--border)'):(answers[i]===k?'var(--accent)':'var(--border)')}`,
+                color:revealed[i]?(k===q.answer?'var(--success)':k===answers[i]?'var(--danger)':'var(--muted)'):(answers[i]===k?'#fff':'var(--text)')
+              }}><strong>{k}.</strong> {v}</button>
+            ))}
+          </div>
+          {!revealed[i]&&answers[i]&&<Btn sm onClick={()=>revealOne(i)}>Reveal answer</Btn>}
+          {revealed[i]&&<div style={{fontSize:12,color:'var(--muted)',background:'var(--surf2)',borderRadius:6,padding:'8px 10px',lineHeight:1.5,marginTop:4}}>{q.explanation}</div>}
+        </Card>
+      ))}
+      {allAnswered&&<Btn primary onClick={finish} style={{width:'100%',marginTop:8}}>Submit & Score</Btn>}
+    </div>
+  );
+}
+
+// ── Paper Writer tab ─────────────────────────────────────────
+function PaperTab({session, courseConfig, usage, setUsage, profIntel}){
+  const [msgs,setMsgs]=useState([]);
+  const [input,setInput]=useState('');
+  const [loading,setLoading]=useState(false);
+  const [uploadCtx,setUploadCtx]=useState('');
+  const bottomRef=useRef(null);
+
+  useEffect(()=>{
+    callData('get_upload_context').then(d=>setUploadCtx(d.context||'')).catch(()=>{});
+    setMsgs([{role:'assistant',content:`I'm your writing assistant for this course. I'll help you with:\n\n• Outlines and argument structure\n• Explaining course concepts clearly\n• Feedback on drafts you've written\n• Proper formatting\n\nNote: CHEM 1114 lab reports follow scientific format. I can help with structure and data interpretation — not completing reports for you. What are you working on?`}]);
+  },[]);
+
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[msgs]);
+
+  const sys=`${profIntel?.system_prompt||''}\n\nYou are a paper writing assistant for this course at UCO. OU has no institution-wide AI policy — follow your professor's course rules. Help the student organize their thinking, improve their writing, and understand financial concepts. You can help with outlines, structure, and feedback on student-written drafts. Do not write complete assignments for the student to submit as their own work.${uploadCtx?'\n\nStudent materials:\n'+uploadCtx:''}`;
+
+  async function send(){
+    if(!input.trim()||loading) return;
+    const userMsg={role:'user',content:input.trim()};
+    const next=[...msgs,userMsg];
+    setMsgs(next);setInput('');setLoading(true);
+    try{
+      const d=await callClaude('chat',{session_id:session.user.id+'_paper',message:userMsg.content,system:sys,messages:next.slice(-10).map(m=>({role:m.role,content:m.content}))});
+      setMsgs([...next,{role:'assistant',content:d.response||d.content||''}]);
+      await callData('track_usage',{feature:'paper'});
+      setUsage(prev=>({...prev,usage:{...prev.usage,paper_used:(prev.usage?.paper_used||0)+1}}));
+    }catch(e){setMsgs([...next,{role:'assistant',content:'Error: '+e.message}]);}
+    finally{setLoading(false);}
+  }
+
+  return(
+    <div style={{display:'flex',flexDirection:'column',height:'calc(100vh - 120px)',animation:'fadeIn .3s ease'}}>
+      <div style={{flex:1,overflowY:'auto',display:'flex',flexDirection:'column',gap:12,paddingBottom:12}}>
+        {msgs.map((m,i)=>(
+          <div key={i} style={{display:'flex',gap:10,alignItems:'flex-start',flexDirection:m.role==='user'?'row-reverse':'row'}}>
+            <div style={{width:28,height:28,borderRadius:'50%',background:m.role==='user'?'var(--accent)':'var(--surf2)',border:'1px solid var(--border2)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:12,fontWeight:700,flexShrink:0}}>{m.role==='user'?'U':'P'}</div>
+            <div style={{maxWidth:'80%',background:m.role==='user'?'var(--accent)':'var(--surf)',border:`1px solid ${m.role==='user'?'var(--accent)':'var(--border)'}`,borderRadius:10,padding:'10px 14px',fontSize:13,lineHeight:1.6,color:m.role==='user'?'#fff':'var(--text)',whiteSpace:'pre-wrap'}}>{m.content}</div>
+          </div>
+        ))}
+        {loading&&<div style={{display:'flex',gap:10,alignItems:'center'}}>
+          <div style={{width:28,height:28,borderRadius:'50%',background:'var(--surf2)',border:'1px solid var(--border2)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:12}}>P</div>
+          <div style={{background:'var(--surf)',border:'1px solid var(--border)',borderRadius:10,padding:'10px 14px'}}><Spin s={14}/></div>
+        </div>}
+        <div ref={bottomRef}/>
+      </div>
+      <div style={{display:'flex',gap:8,paddingTop:12,borderTop:'1px solid var(--border)'}}>
+        <textarea value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}} placeholder="Share your draft, ask for an outline, or discuss a concept..." rows={2} style={{flex:1,background:'var(--surf)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px',fontSize:13,resize:'none',outline:'none',lineHeight:1.5}}/>
+        <Btn primary onClick={send} disabled={loading||!input.trim()} style={{alignSelf:'flex-end'}}>Send</Btn>
+      </div>
+    </div>
+  );
+}
+
+// ── Formula Reference tab ────────────────────────────────────
+function ReferenceTab({courseConfig}){
+  const [q,setQ]=useState('');
+  const topics = courseConfig?.topics || [];
+  const textbook = courseConfig?.textbook || {};
+
+  // Finance-specific formula bank
+  const formulas = [
+    {category:'Time Value of Money',emoji:'⏳',items:[
+      {name:'Future Value (FV)',formula:'FV = PV × (1 + r)^n',note:'r = rate per period, n = periods'},
+      {name:'Present Value (PV)',formula:'PV = FV / (1 + r)^n',note:'Discounting future cash flows'},
+      {name:'FV of Annuity',formula:'FVA = PMT × [(1+r)^n - 1] / r',note:'Equal payments, end of period'},
+      {name:'PV of Annuity',formula:'PVA = PMT × [1 - (1+r)^-n] / r',note:'PV of equal future payments'},
+      {name:'PV of Perpetuity',formula:'PV = PMT / r',note:'Never-ending equal payments'},
+    ]},
+    {category:'Bond Valuation',emoji:'🔖',items:[
+      {name:'Bond Price',formula:'P = Σ[C/(1+r)^t] + F/(1+r)^n',note:'C = coupon, F = face, r = YTM'},
+      {name:'Current Yield',formula:'CY = Annual Coupon / Current Price',note:'Not the same as YTM'},
+      {name:'YTM (approx)',formula:'YTM ≈ [C + (F-P)/n] / [(F+P)/2]',note:'Approximation formula'},
+    ]},
+    {category:'Risk & Return / CAPM',emoji:'⚖️',items:[
+      {name:'Expected Return',formula:'E(r) = Σ[p_i × r_i]',note:'Probability-weighted returns'},
+      {name:'Variance',formula:'σ² = Σ[p_i × (r_i - E(r))²]',note:'Standard deviation = √σ²'},
+      {name:'Portfolio Return',formula:'E(r_p) = w₁r₁ + w₂r₂',note:'Weight × return for each asset'},
+      {name:'CAPM',formula:'r_i = r_f + β_i × (r_m - r_f)',note:'r_f = risk-free, r_m = market return'},
+      {name:'Beta',formula:'β = Cov(r_i, r_m) / Var(r_m)',note:'Systematic risk measure'},
+    ]},
+    {category:'Stock Valuation',emoji:'💹',items:[
+      {name:'Constant Dividend',formula:'P₀ = D / r',note:'Zero growth — like a perpetuity'},
+      {name:'Gordon Growth Model',formula:'P₀ = D₁ / (r - g)',note:'D₁ = next dividend, g = growth rate'},
+      {name:'Non-constant Growth',formula:'P₀ = PV(dividends) + PV(terminal)',note:'Two-stage: model each year then apply Gordon'},
+    ]},
+    {category:'Capital Budgeting',emoji:'🏗️',items:[
+      {name:'NPV',formula:'NPV = Σ[CF_t/(1+r)^t] - CF₀',note:'Accept if NPV > 0'},
+      {name:'IRR',formula:'0 = Σ[CF_t/(1+IRR)^t] - CF₀',note:'Rate making NPV = 0; accept if IRR > WACC'},
+      {name:'MIRR',formula:'MIRR = (FV_inflows/PV_outflows)^(1/n) - 1',note:'Reinvestment at WACC assumption'},
+      {name:'Payback Period',formula:'PP = Year before recovery + (Remaining/CF)',note:'Simple but ignores TVM'},
+    ]},
+    {category:'Financial Ratios',emoji:'📈',items:[
+      {name:'Current Ratio',formula:'Current Assets / Current Liabilities',note:'Liquidity — >1 generally good'},
+      {name:'Debt Ratio',formula:'Total Debt / Total Assets',note:'Leverage — higher = more risk'},
+      {name:'ROE',formula:'Net Income / Common Equity',note:'Du Pont: PM × TA turnover × Equity multiplier'},
+      {name:'P/E Ratio',formula:'Stock Price / EPS',note:'Market value ratio'},
+    ]},
+  ];
+
+  const filtered = q
+    ? formulas.map(cat=>({...cat,items:cat.items.filter(f=>f.name.toLowerCase().includes(q.toLowerCase())||f.formula.toLowerCase().includes(q.toLowerCase()))})).filter(cat=>cat.items.length>0)
+    : formulas;
+
+  return(
+    <div style={{animation:'fadeIn .3s ease'}}>
+      <input type="text" placeholder="Search formulas..." value={q} onChange={e=>setQ(e.target.value)}
+        style={{width:'100%',background:'var(--surf)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 14px',fontSize:14,marginBottom:12,outline:'none',color:'var(--text)'}}/>
+
+      {textbook.title&&(
+        <div style={{fontSize:12,color:'var(--muted)',marginBottom:16,padding:'8px 12px',background:'var(--surf)',borderRadius:6,border:'1px solid var(--border)'}}>
+          📖 {textbook.title} — {textbook.author}, {textbook.edition}
+        </div>
+      )}
+
+      {filtered.map((cat,ci)=>(
+        <div key={ci} style={{marginBottom:20}}>
+          <div style={{fontSize:13,fontWeight:600,marginBottom:8,display:'flex',alignItems:'center',gap:6}}>
+            <span>{cat.emoji}</span>{cat.category}
+          </div>
+          {cat.items.map((f,fi)=>(
+            <Card key={fi} style={{padding:'10px 14px',marginBottom:6}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:10}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,fontWeight:600,marginBottom:4}}>{f.name}</div>
+                  <div style={{fontFamily:'monospace',fontSize:13,color:'var(--accent)',marginBottom:f.note?4:0}}>{f.formula}</div>
+                  {f.note&&<div style={{fontSize:11,color:'var(--muted)'}}>{f.note}</div>}
+                </div>
+                <button onClick={()=>navigator.clipboard?.writeText(f.formula)} style={{background:'var(--surf2)',border:'1px solid var(--border)',borderRadius:6,padding:'4px 8px',fontSize:10,color:'var(--muted)',cursor:'pointer',flexShrink:0}}>Copy</button>
+              </div>
+            </Card>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Note Sheet tab ───────────────────────────────────────────
+function NoteSheetTab({session, courseConfig, usage, setUsage, profIntel}){
+  const [topic,setTopic]=useState(null);
+  const [content,setContent]=useState('');
+  const [saved,setSaved]=useState([]);
+  const [loading,setLoading]=useState(false);
+  const [err,setErr]=useState('');
+  const topics = courseConfig?.topics || [];
+
+  useEffect(()=>{ callData('get_notesheets').then(d=>setSaved(d.notesheets||[])).catch(()=>{}); },[]);
+
+  async function generate(){
+    if(!topic){setErr('Select a topic.');return;}
+    setLoading(true);setErr('');setContent('');
+    const sys=`${profIntel?.system_prompt||''}\n\nCreate a one-page reference sheet in HTML. Use: <h3> for section headers, <div class="formula-box" style="background:#1e2840;border-left:3px solid #3b82f6;border-radius:4px;padding:8px 12px;margin:6px 0;font-family:monospace;font-size:12px"> for formulas, <ul><li> for key points, <strong> for terms. Calibrate to your professor's high-weight exam topics. Dense and scannable — this is a cheat sheet, not an essay. HTML only.`;
+    try{
+      const d=await callClaude('generate',{system:sys,messages:[{role:'user',content:`Create a one-page reference sheet for ${topic.chapter?'Ch '+topic.chapter+': ':''}${topic.name} in this course. Include all key formulas, definitions, and exam tips specific to your professor's testing style.`}],max_tokens:1500});
+      setContent((d.content||[]).filter(b=>b.type==='text').map(b=>b.text).join(''));
+      await callData('track_usage',{feature:'notesheet'});
+      setUsage(prev=>({...prev,usage:{...prev.usage,notesheet_used:(prev.usage?.notesheet_used||0)+1}}));
+    }catch(e){setErr('Failed: '+e.message);}
+    finally{setLoading(false);}
+  }
+
+  async function save(){
+    if(!content||!topic) return;
+    const d=await callData('save_notesheet',{title:(topic.chapter?'Ch '+topic.chapter+': ':'')+topic.name,content,topics:[topic.name]});
+    if(d.ok) setSaved(prev=>[d.notesheet,...prev].filter(Boolean));
+  }
+
+  return(
+    <div style={{animation:'fadeIn .3s ease'}}>
+      <Card style={{padding:16,marginBottom:16}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:12}}>Generate a reference sheet</div>
+        <TopicPicker topics={topics} selected={topic} onSelect={setTopic}/>
+        {err&&<div style={{fontSize:12,color:'var(--danger)',background:'var(--danger-bg)',borderRadius:6,padding:'8px 12px',marginBottom:10}}>{err}</div>}
+        <Btn primary onClick={generate} disabled={loading||!topic} style={{width:'100%'}}>
+          {loading?<span style={{display:'flex',alignItems:'center',gap:8,justifyContent:'center'}}><Spin s={14} c='#fff'/>Generating...</span>:'Generate Reference Sheet'}
+        </Btn>
+      </Card>
+
+      {content&&(
+        <Card style={{padding:16,marginBottom:16}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+            <div style={{fontSize:13,fontWeight:600}}>{topic?.name}</div>
+            <div style={{display:'flex',gap:8}}>
+              <Btn sm onClick={save}>Save</Btn>
+              <Btn sm onClick={()=>window.print()}>Print</Btn>
+            </div>
+          </div>
+          <div style={{fontSize:13,lineHeight:1.7}} dangerouslySetInnerHTML={{__html:content}}/>
+        </Card>
+      )}
+
+      {saved.length>0&&(
+        <div>
+          <div style={{fontSize:11,fontWeight:600,color:'var(--muted)',textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:10}}>Saved sheets ({saved.length})</div>
+          {saved.map(s=>(
+            <Card key={s.id} style={{padding:'10px 14px',marginBottom:8,cursor:'pointer'}} onClick={()=>setContent(s.content)}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <div>
+                  <div style={{fontSize:12,fontWeight:500}}>{s.title}</div>
+                  <div style={{fontSize:11,color:'var(--muted)',marginTop:2}}>{fmtDate(s.created_at)}</div>
+                </div>
+                <span style={{color:'var(--muted)',fontSize:18}}>›</span>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Uploads tab ──────────────────────────────────────────────
+function UploadsTab({session}){
+  const [uploads,setUploads]=useState([]);
+  const [uploading,setUploading]=useState(false);
+  const [sourceType,setSourceType]=useState('personal_notes');
+  const [err,setErr]=useState('');
+  const [success,setSuccess]=useState('');
+  const fileRef=useRef(null);
+
+  const sourceTypes=[
+    {id:'syllabus',label:'Syllabus',emoji:'📋'},
+    {id:'lecture_slides',label:'Lecture Slides',emoji:'📊'},
+    {id:'canvas_export',label:'Canvas Export',emoji:'🎓'},
+    {id:'personal_notes',label:'Personal Notes',emoji:'✏️'},
+    {id:'practice_problems',label:'Practice Problems',emoji:'🔢'},
+    {id:'other',label:'Other',emoji:'📄'},
+  ];
+
+  useEffect(()=>{
+    callData('get_uploads').then(d=>setUploads(d.uploads||[])).catch(()=>{});
+  },[]);
+
+  async function handleFile(e){
+    const file=e.target.files?.[0];
+    if(!file) return;
+    if(file.size>10*1024*1024){setErr('File too large — max 10MB');return;}
+    if(uploads.length>=5){setErr('Upload limit reached — max 5 uploads. Delete one to add another.');return;}
+    setUploading(true);setErr('');setSuccess('');
+    try{
+      const sb=await getSB();
+      const sess=(await sb.auth.getSession()).data.session;
+      const d=await callUpload(file, sess.access_token);
+      if(!d.ok) throw new Error(d.error||'Upload failed');
+      setSuccess(`"${file.name}" uploaded${d.has_text?' — text extracted and active in AI sessions':''}.`);
+      await callData('get_uploads').then(r=>setUploads(r.uploads||[]));
+      fileRef.current.value='';
+    }catch(ex){setErr(ex.message);}
+    finally{setUploading(false);}
+  }
+
+  async function deleteUpload(id){
+    try{
+      await callData('delete_upload',{upload_id:id});
+      setUploads(prev=>prev.filter(u=>u.id!==id));
+    }catch(ex){setErr(ex.message);}
+  }
+
+  const getEmoji=type=>sourceTypes.find(t=>t.id===type)?.emoji||'📄';
+
+  return(
+    <div style={{animation:'fadeIn .3s ease'}}>
+      <Card style={{padding:20,marginBottom:20}}>
+        <div style={{fontSize:13,fontWeight:600,marginBottom:4}}>Upload course materials</div>
+        <div style={{fontSize:12,color:'var(--muted)',lineHeight:1.6,marginBottom:14}}>
+          Upload anything your professor hasn't baked in — your own notes, a handout she gave in class, practice problems, or the syllabus. The AI will read it and use it automatically in every study, tutoring, and paper session. Max 5 uploads, 10MB each.
+        </div>
+        <div style={{marginBottom:14}}>
+          <div style={{fontSize:11,color:'var(--muted)',marginBottom:8}}>What are you uploading?</div>
+          <div style={{display:'flex',gap:6,flexWrap:'wrap'}}>
+            {sourceTypes.map(t=>(
+              <button key={t.id} onClick={()=>setSourceType(t.id)} style={{
+                background:sourceType===t.id?'var(--surf2)':'var(--surf)',
+                border:`1px solid ${sourceType===t.id?'var(--accent)':'var(--border)'}`,
+                borderRadius:6,padding:'5px 10px',fontSize:11,fontWeight:500,
+                color:sourceType===t.id?'var(--accent)':'var(--muted)',cursor:'pointer'
+              }}>{t.emoji} {t.label}</button>
+            ))}
+          </div>
+        </div>
+
+        <input ref={fileRef} type="file" accept=".pdf,.txt,.md,.png,.jpg,.jpeg,.webp" onChange={handleFile} style={{display:'none'}}/>
+        <Btn onClick={()=>fileRef.current?.click()} disabled={uploading||uploads.length>=5} primary style={{width:'100%'}}>
+          {uploading
+            ?<span style={{display:'flex',alignItems:'center',gap:8,justifyContent:'center'}}><Spin s={14} c='#fff'/>Uploading + extracting text...</span>
+            :uploads.length>=5?'Upload limit reached (5/5)':'📁 Choose file to upload'}
+        </Btn>
+
+        <div style={{fontSize:11,color:'var(--muted)',marginTop:8}}>Supported: PDF, images (PNG/JPG), plain text · Max 10MB · {5-uploads.length} upload{5-uploads.length===1?'':'s'} remaining</div>
+
+        {err&&<div style={{fontSize:12,color:'var(--danger)',background:'var(--danger-bg)',borderRadius:6,padding:'8px 12px',marginTop:10}}>{err}</div>}
+        {success&&<div style={{fontSize:12,color:'var(--success)',background:'var(--success-bg)',border:'1px solid var(--success-border)',borderRadius:6,padding:'8px 12px',marginTop:10}}>✓ {success}</div>}
+      </Card>
+
+      {uploads.length===0?(
+        <div style={{textAlign:'center',padding:'40px 20px',color:'var(--muted)',fontSize:13}}>
+          <div style={{fontSize:32,marginBottom:12}}>📂</div>
+          No uploads yet. Add your syllabus, notes, or class handouts above — the AI will use them in every session.
+        </div>
+      ):(
+        <div>
+          <div style={{fontSize:11,fontWeight:600,color:'var(--muted)',textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:10}}>Your uploads ({uploads.length}/5)</div>
+          {uploads.map(u=>(
+            <Card key={u.id} style={{padding:'12px 14px',marginBottom:8}}>
+              <div style={{display:'flex',alignItems:'flex-start',gap:10}}>
+                <div style={{fontSize:22,flexShrink:0}}>{getEmoji(u.source_type)}</div>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:13,fontWeight:500,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{u.file_name}</div>
+                  <div style={{fontSize:11,color:'var(--muted)',marginTop:2}}>
+                    {u.file_size_bytes?Math.round(u.file_size_bytes/1024)+'KB · ':''}{fmtDate(u.created_at)}
+                  </div>
+                  <div style={{fontSize:11,color:'var(--success)',marginTop:2}}>✓ Active in all AI sessions</div>
+                </div>
+                <button onClick={()=>deleteUpload(u.id)} style={{background:'none',border:'none',color:'var(--muted)',cursor:'pointer',fontSize:20,flexShrink:0,padding:'0 4px',lineHeight:1}}>×</button>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Premium tab ──────────────────────────────────────────────
+function PremiumTab({session, courseConfig, usage, setUsage, isPremium, profIntel}){
+  const [subTab,setSubTab]=useState('socratic');
+
+  if(!isPremium) return(
+    <div style={{textAlign:'center',padding:40}}>
+      <div style={{fontSize:40,marginBottom:16}}>🏛️</div>
+      <div style={{fontSize:18,fontWeight:700,marginBottom:8}}>Premium Features</div>
+      <div style={{fontSize:13,color:'var(--muted)',marginBottom:24,lineHeight:1.6,maxWidth:320,margin:'0 auto 24px'}}>
+        Unlock Socratic Tutoring and Essay Grader — calibrated to your professor's known grading standards.
+      </div>
+      <a href={STRIPE.premium} target="_blank" style={{display:'inline-block',padding:'12px 28px',background:'var(--premium)',borderRadius:8,textDecoration:'none',color:'#fff',fontSize:13,fontWeight:600}}>
+        Unlock Premium — $20 →
+      </a>
+      <div style={{fontSize:11,color:'var(--muted)',marginTop:12}}>One-time payment · Valid through December 31, 2026</div>
+    </div>
+  );
+
+  return(
+    <div style={{animation:'fadeIn .3s ease'}}>
+      <div style={{display:'flex',gap:8,marginBottom:20}}>
+        {['socratic','essay'].map(t=>(
+          <button key={t} onClick={()=>setSubTab(t)} style={{flex:1,padding:'9px',background:subTab===t?'var(--premium-bg)':'var(--surf)',border:`1px solid ${subTab===t?'var(--premium)':'var(--border)'}`,borderRadius:8,fontSize:12,fontWeight:600,color:subTab===t?'var(--premium)':'var(--muted)',cursor:'pointer'}}>
+            {t==='socratic'?'🏛️ Socratic Tutor':'📝 Essay Grader'}
+          </button>
+        ))}
+      </div>
+      {subTab==='socratic'?<SocraticTutor session={session} courseConfig={courseConfig} usage={usage} setUsage={setUsage} profIntel={profIntel}/>:<EssayGrader session={session} courseConfig={courseConfig} profIntel={profIntel}/>}
+    </div>
+  );
+}
+
+function SocraticTutor({session, courseConfig, usage, setUsage, profIntel}){
+  const [msgs,setMsgs]=useState([{role:'assistant',content:'Welcome to Socratic tutoring. I won\'t give you answers directly — I\'ll ask questions that build the reasoning your professor\'s exams actually test. What concept or problem are we working through?'}]);
+  const [input,setInput]=useState('');
+  const [loading,setLoading]=useState(false);
+  const bottomRef=useRef(null);
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[msgs]);
+
+  const sys=`${profIntel?.system_prompt||''}\n\nYou are a Socratic tutor for this course. Never give direct answers. Instead, ask questions that lead the student to discover the answer themselves. When a student is stuck, ask smaller questions that break down the concept. When they get something right, acknowledge it and probe deeper. Your goal is understanding that holds up under exam pressure — not just answer recall. Keep responses concise.`;
+
+  async function send(){
+    if(!input.trim()||loading) return;
+    const userMsg={role:'user',content:input.trim()};
+    const next=[...msgs,userMsg];
+    setMsgs(next);setInput('');setLoading(true);
+    try{
+      const d=await callClaude('chat',{session_id:session.user.id+'_socratic',message:userMsg.content,system:sys,messages:next.slice(-10).map(m=>({role:m.role,content:m.content}))});
+      setMsgs([...next,{role:'assistant',content:d.response||''}]);
+    }catch(e){setMsgs([...next,{role:'assistant',content:'Error: '+e.message}]);}
+    finally{setLoading(false);}
+  }
+
+  return(
+    <div style={{display:'flex',flexDirection:'column',height:'calc(100vh - 220px)'}}>
+      <div style={{flex:1,overflowY:'auto',display:'flex',flexDirection:'column',gap:12,paddingBottom:12}}>
+        {msgs.map((m,i)=>(
+          <div key={i} style={{display:'flex',gap:10,alignItems:'flex-start',flexDirection:m.role==='user'?'row-reverse':'row'}}>
+            <div style={{width:28,height:28,borderRadius:'50%',background:m.role==='user'?'var(--accent)':'var(--premium-bg)',border:`1px solid ${m.role==='user'?'var(--accent)':'var(--premium)'}`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:12,fontWeight:700,flexShrink:0,color:m.role==='user'?'#fff':'var(--premium)'}}>{m.role==='user'?'U':'S'}</div>
+            <div style={{maxWidth:'80%',background:m.role==='user'?'var(--accent)':'var(--surf)',border:`1px solid ${m.role==='user'?'var(--accent)':'var(--border)'}`,borderRadius:10,padding:'10px 14px',fontSize:13,lineHeight:1.6,color:m.role==='user'?'#fff':'var(--text)',whiteSpace:'pre-wrap'}}>{m.content}</div>
+          </div>
+        ))}
+        {loading&&<div style={{display:'flex',gap:10}}><div style={{width:28,height:28,borderRadius:'50%',background:'var(--premium-bg)',border:'1px solid var(--premium)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:12,color:'var(--premium)'}}>S</div><div style={{background:'var(--surf)',border:'1px solid var(--border)',borderRadius:10,padding:'10px 14px'}}><Spin s={14} c='var(--premium)'/></div></div>}
+        <div ref={bottomRef}/>
+      </div>
+      <div style={{display:'flex',gap:8,paddingTop:12,borderTop:'1px solid var(--border)'}}>
+        <textarea value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}}} placeholder="Share your thinking or ask a question..." rows={2} style={{flex:1,background:'var(--surf)',border:'1px solid var(--border)',borderRadius:8,padding:'10px 12px',fontSize:13,resize:'none',outline:'none',lineHeight:1.5}}/>
+        <Btn premium onClick={send} disabled={loading||!input.trim()} style={{alignSelf:'flex-end'}}>Ask</Btn>
+      </div>
+    </div>
+  );
+}
+
+function EssayGrader({session, courseConfig, profIntel}){
+  const [draft,setDraft]=useState('');
+  const [type,setType]=useState('analysis');
+  const [feedback,setFeedback]=useState('');
+  const [loading,setLoading]=useState(false);
+  const [err,setErr]=useState('');
+
+  const sys=`${profIntel?.system_prompt||''}\n\nYou are an essay grader for this course at UCO calibrated to your professor's grading standards. Evaluate student writing on: argument clarity, financial accuracy, evidence quality, structure, and writing quality. Give specific, actionable feedback. Format your response in HTML with clear sections for each criterion. End with an overall assessment and top 3 improvements. Be honest but constructive.`;
+
+  async function grade(){
+    if(!draft.trim()){setErr('Paste your draft first.');return;}
+    setLoading(true);setErr('');setFeedback('');
+    try{
+      const d=await callClaude('generate',{system:sys,messages:[{role:'user',content:`Grade this ${type} for this course:\n\n${draft}`}],max_tokens:1500});
+      setFeedback((d.content||[]).filter(b=>b.type==='text').map(b=>b.text).join(''));
+    }catch(e){setErr('Failed: '+e.message);}
+    finally{setLoading(false);}
+  }
+
+  return(
+    <div>
+      <div style={{marginBottom:12}}>
+        <div style={{fontSize:11,color:'var(--muted)',marginBottom:6}}>Assignment type</div>
+        <select value={type} onChange={e=>setType(e.target.value)} style={{background:'var(--surf)',border:'1px solid var(--border)',borderRadius:6,padding:'7px 10px',fontSize:12,outline:'none',color:'var(--text)'}}>
+          <option value="analysis">Financial analysis</option>
+          <option value="case">Case study response</option>
+          <option value="memo">Business memo</option>
+          <option value="essay">Essay</option>
+        </select>
+      </div>
+      <textarea value={draft} onChange={e=>setDraft(e.target.value)} placeholder="Paste your draft here..." rows={8} style={{width:'100%',background:'var(--surf)',border:'1px solid var(--border)',borderRadius:8,padding:'12px',fontSize:13,resize:'vertical',outline:'none',lineHeight:1.6,marginBottom:10}}/>
+      {err&&<div style={{fontSize:12,color:'var(--danger)',background:'var(--danger-bg)',borderRadius:6,padding:'8px 12px',marginBottom:10}}>{err}</div>}
+      <Btn premium onClick={grade} disabled={loading||!draft.trim()} style={{width:'100%',marginBottom:16}}>
+        {loading?<span style={{display:'flex',alignItems:'center',gap:8,justifyContent:'center'}}><Spin s={14} c='#fff'/>Grading...</span>:'Grade My Draft'}
+      </Btn>
+      {feedback&&<Card style={{padding:16}}><div style={{fontSize:13,lineHeight:1.7}} dangerouslySetInnerHTML={{__html:feedback}}/></Card>}
+    </div>
+  );
+}
+
+// ── Main course app shell ────────────────────────────────────
+function CourseApp({session, courseConfig, usage, setUsage, isPremium, profIntel}){
+  const [tab,setTab]=useState('dashboard');
+  const sb=useRef(null);
+
+  const tabs=[
+    {id:'dashboard',label:'Dashboard',icon:'⊞'},
+    {id:'tutor',label:'Tutor',icon:'💬'},
+    {id:'guide',label:'Guide',icon:'📖'},
+    {id:'exam',label:'Exam',icon:'📝'},
+    {id:'paper',label:'Paper',icon:'✍️'},
+    {id:'ref',label:'Formulas',icon:'∑'},
+    {id:'notes',label:'Note Sheet',icon:'📋'},
+    {id:'uploads',label:'Uploads',icon:'📁'},
+    ...(isPremium?[{id:'premium',label:'Premium',icon:'🏛️'}]:[]),
+  ];
+
+  async function signOut(){
+    const sb=await getSB();
+    sb.auth.signOut();
+  }
+
+  const sharedProps={session, courseConfig, usage, setUsage, profIntel, isPremium};
+
+  return(
+    <div style={{display:'flex',height:'100vh',overflow:'hidden'}}>
+      {/* Sidebar */}
+      <div className="no-print" style={{width:200,background:'var(--surf)',borderRight:'1px solid var(--border)',display:'flex',flexDirection:'column',flexShrink:0,overflowY:'auto'}}>
+        <div style={{padding:'16px 14px',borderBottom:'1px solid var(--border)'}}>
+          <div style={{fontSize:11,fontWeight:700,color:'var(--accent)',letterSpacing:'0.12em',textTransform:'uppercase',marginBottom:2}}>ProfPrep</div>
+          <div style={{fontSize:13,fontWeight:600,lineHeight:1.3}}>this course</div>
+          <div style={{fontSize:11,color:'var(--muted)',marginTop:2}}>Business Finance · OU</div>
+        </div>
+
+        <div style={{flex:1,padding:'8px 0'}}>
+          {tabs.map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)} style={{
+              width:'100%',display:'flex',alignItems:'center',gap:10,padding:'9px 14px',
+              background:tab===t.id?'var(--surf2)':'transparent',
+              border:'none',
+              borderLeft:`3px solid ${tab===t.id?'var(--accent)':'transparent'}`,
+              cursor:'pointer',textAlign:'left',transition:'all .1s',
+              color:tab===t.id?'var(--text)':'var(--muted)',fontSize:13
+            }}>
+              <span style={{fontSize:16,width:20,textAlign:'center',flexShrink:0}}>{t.icon}</span>
+              {t.label}
+              {t.id==='premium'&&<span style={{marginLeft:'auto',fontSize:9,padding:'2px 5px',background:'var(--premium-bg)',border:'1px solid var(--premium)',borderRadius:3,color:'var(--premium)',fontWeight:700}}>PRO</span>}
+            </button>
+          ))}
+        </div>
+
+        <div style={{padding:'12px 14px',borderTop:'1px solid var(--border)'}}>
+          <div style={{fontSize:11,color:'var(--muted)',marginBottom:8,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{session.user.email}</div>
+          <div style={{fontSize:10,color:'var(--muted)',marginBottom:8}}>
+            Expires Dec 31, 2026
+          </div>
+          <button onClick={signOut} style={{background:'none',border:'1px solid var(--border)',borderRadius:6,padding:'5px 10px',fontSize:11,color:'var(--muted)',cursor:'pointer',width:'100%'}}>Sign out</button>
+        </div>
+      </div>
+
+      {/* Main content */}
+      <div style={{flex:1,overflowY:'auto',padding:20}}>
+        {tab==='dashboard'&&<DashboardTab session={session} setTab={setTab} {...sharedProps}/>}
+        {tab==='tutor'&&<StudyTab {...sharedProps}/>}
+        {tab==='guide'&&<GuideTab {...sharedProps}/>}
+        {tab==='exam'&&<ExamTab {...sharedProps}/>}
+        {tab==='paper'&&<PaperTab {...sharedProps}/>}
+        {tab==='ref'&&<ReferenceTab courseConfig={courseConfig}/>}
+        {tab==='notes'&&<NoteSheetTab {...sharedProps}/>}
+        {tab==='uploads'&&<UploadsTab session={session}/>}
+        {tab==='premium'&&<PremiumTab {...sharedProps}/>}
+      </div>
+    </div>
+  );
+}
+
+// ── Root ─────────────────────────────────────────────────────
+function App(){
+  const {session,loading}=useAuth();
+
+  if(loading) return(
+    <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',gap:12}}>
+      <Spin s={28}/>
+      <div style={{fontSize:13,color:'var(--muted)'}}>Loading...</div>
+    </div>
+  );
+
+  if(!session) return <AuthScreen/>;
+
+  return(
+    <AccessGate session={session}>
+      {(props)=><CourseApp session={session} {...props}/>}
+    </AccessGate>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <AuthProvider><App/></AuthProvider>
+);
+</script>
+</body>
+</html>
